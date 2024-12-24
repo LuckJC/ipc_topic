@@ -31,11 +31,10 @@ struct topic_subscribe {
 	__user void *target;
 };
 
-//#define IPC_TOPIC_WRITE_READ		_IOWR('t', 1, struct binder_write_read)
-#define IPC_TOPIC_CREATE		_IOW('t', 2, struct topic_mate)
-#define IPC_TOPIC_PUBLISH		_IOW('t', 3, __s64)
-#define IPC_TOPIC_SUBSCRIBE		_IOW('t', 4, __s64)
-#define IPC_TOPIC_DELETE		_IOW('t', 5, __s64)
-#define IPC_TOPIC_GET			_IOW('t', 6, __s64)
+#define IPC_TOPIC_CREATE		_IOWR('t', 1, struct topic_mate)
+#define IPC_TOPIC_PUBLISH		_IOW('t', 2, struct topic_content)
+#define IPC_TOPIC_SUBSCRIBE		_IOW('t', 3, struct topic_subscribe)
+#define IPC_TOPIC_DELETE		_IOW('t', 4, __s64)
+#define IPC_TOPIC_GET			_IOR('t', 5, struct topic_content)
 
 #endif

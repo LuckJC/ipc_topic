@@ -3,20 +3,16 @@
  * Copyright (C) 2020 Unisoc Inc.
  */
 
-#include <linux/mm.h>
 #include <asm/string.h>
 #include <asm/uaccess.h>
-#include <linux/wait.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/uaccess.h>
-#include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/slab.h>
-#include <linux/string.h>
+#include <linux/list.h>
 #include <linux/poll.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
 
 #include "ipc_topic.h"
 
@@ -26,7 +22,7 @@ struct topic_struct {
 	char *topic_name;  // 主题名称
 	int data_type;	   // 主题的数据类型，可自行定义枚举等方式表示不同类型
 	int data_size;	   // 主题的数据大小
-	uid_t owner;	   // 主题创建者的用户ID
+	pid_t owner;	   // 主题创建者的用户ID
 	char *auth_scope;  // 订阅授权范围（"none"、"all" 或具体用户组等）
 	void *last_data;   // 主题最后一次发布的数据指针
 	struct topic_proc *proc;
@@ -63,10 +59,24 @@ struct topic_event {
 
 enum { IPC_TOPIC_PUBLISHER, IPC_TOPIC_SUBSCRIBER };
 
+// 全局主题列表头
 static struct list_head topic_list;
+// 互斥锁保护主题相关操作
 static DEFINE_MUTEX(topic_lock);
 
-struct topic_struct *find_topic_byname(char *topic_name)
+// 安全地复制用户空间字符串到内核空间
+static char *safe_memdup_user(const void __user *src, size_t size)
+{
+	char *dst = kmalloc(size, GFP_KERNEL);
+	if (dst && copy_from_user(dst, src, size)) {
+		kfree(dst);
+		return NULL;
+	}
+	return dst;
+}
+
+// 查找主题（通过主题名称）
+static struct topic_struct *find_topic_byname(char *topic_name)
 {
 	struct topic_struct *topic;
 	list_for_each_entry(topic, &topic_list, list)
@@ -78,7 +88,8 @@ struct topic_struct *find_topic_byname(char *topic_name)
 	return NULL;
 }
 
-struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
+// 查找主题（通过进程和主题ID）
+static struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
 {
 	struct topic_struct *topic;
 	list_for_each_entry(topic, &proc->topics, list_p)
@@ -90,6 +101,7 @@ struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
 	return NULL;
 }
 
+// 查找主题引用（通过进程和主题名称）
 static struct topic_ref *find_ref_byname(struct topic_proc *proc, char *topic_name)
 {
 	struct topic_ref *ref;
@@ -102,82 +114,110 @@ static struct topic_ref *find_ref_byname(struct topic_proc *proc, char *topic_na
 	return NULL;
 }
 
-// 创建主题函数
-static int create_topic(struct topic_mate *tm, struct topic_proc *proc)
+// 创建主题
+static struct topic_struct *create_topic(struct topic_mate *tm, struct topic_proc *proc)
 {
 	char *topic_name;
-	// 分配主题结构体内存空间
 	struct topic_struct *new_topic;
-	topic_name = (char *)memdup_user(tm->topic_name, tm->name_size);
+
+	// 先查找是否已存在同名主题，若存在则直接返回（这里假设同名主题不应重复创建，可根据实际需求调整逻辑）
+	topic_name = safe_memdup_user(tm->topic_name, tm->name_size);
+	if (!topic_name) {
+		printk(KERN_ERR "create_topic: Failed to copy topic name from user space\n");
+		return NULL;
+	}
 	new_topic = find_topic_byname(topic_name);
 	if (new_topic) {
-		kfree(new_topic);
-		return -EINVAL;
+		kfree(topic_name);	// 释放复制的主题名称内存
+		printk(KERN_INFO "create_topic: Topic with the same name already exists\n");
+		return NULL;
 	}
 
 	new_topic = kmalloc(sizeof(struct topic_struct), GFP_KERNEL);
 	if (!new_topic) {
-		return -ENOMEM;	 // 返回内存不足错误码
+		kfree(topic_name);	// 确保分配失败时释放已申请的内存
+		printk(KERN_ERR "create_topic: Failed to allocate memory for topic_struct\n");
+		return NULL;
 	}
+
 	new_topic->handle = proc->unique_id++;
-	// 初始化主题名称等属性
-	new_topic->topic_name = (char *)memdup_user(tm->topic_name, tm->name_size);
+	new_topic->topic_name = topic_name;
 	new_topic->data_type = tm->data_type;
 	new_topic->data_size = tm->data_size;
 	new_topic->owner = current->pid;  // 当前进程作为主题创建者
-	new_topic->auth_scope = memdup_user(tm->auth_scope, tm->auth_size);
-	// 初始化订阅者链表等
+	new_topic->auth_scope = safe_memdup_user(tm->auth_scope, tm->auth_size);
+	if (!new_topic->auth_scope) {
+		kfree(topic_name);
+		kfree(new_topic);
+		printk(KERN_ERR "create_topic: Failed to copy auth scope from user space\n");
+		return NULL;
+	}
 	INIT_LIST_HEAD(&new_topic->subscribers);
 	new_topic->last_data = NULL;
 	new_topic->proc = proc;
+
 	// 将主题添加到内核主题列表（假设存在全局主题列表头 topic_list）
 	list_add_tail(&new_topic->list, &topic_list);
 	list_add_tail(&new_topic->list_p, &proc->topics);
-	return (int)new_topic;	// 返回主题结构体指针（可转换为整数便于上层使用）
+
+	return new_topic;
 }
 
-static int create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr)
+// 创建主题引用
+static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr)
 {
-	// 分配主题结构体内存空间
 	struct topic_ref *ref;
+
 	ref = find_ref_byname(proc, topic->topic_name);
 	if (ref)
-		return (int)ref;
+		return ref;
 
 	ref = kmalloc(sizeof(struct topic_ref), GFP_KERNEL);
 	if (!ref) {
-		return -ENOMEM;	 // 返回内存不足错误码
+		printk(KERN_ERR "create_topic_ref: Failed to allocate memory for topic_ref\n");
+		return NULL;  // 返回内存不足错误码
 	}
-	// 初始化主题名称等属性
+
 	ref->topic = topic;
 	ref->proc = proc;
 	ref->target = ptr;
 	list_add_tail(&ref->list, &proc->topic_refs);
 
-	return (int)ref;  // 返回主题结构体指针（可转换为整数便于上层使用）
+	return ref;
 }
 
+// 向主题引用的事件队列中放入事件
 static int put_event(struct topic_ref *ref, struct topic_content *content)
 {
 	struct topic_event *event;
+
 	event = kmalloc(sizeof(struct topic_event), GFP_KERNEL);
 	if (!event) {
+		printk(KERN_ERR "put_event: Failed to allocate memory for topic_event\n");
 		return -ENOMEM;	 // 返回内存不足错误码
 	}
+
 	event->type = content->type;
-	event->data = memdup_user(event->data, content->data_size);
+	event->data = safe_memdup_user(content->data, content->data_size);
+	if (!event->data) {	 // 检查数据复制是否成功
+		kfree(event);
+		printk(KERN_ERR "put_event: Failed to copy data for topic_event\n");
+		return -ENOMEM;
+	}
 	event->size = content->data_size;
 
 	list_add_tail(&event->list, &ref->event_queue);
 
-	return (int)event;
+	return 0;
 }
 
+// 从主题引用的事件队列中获取事件
 static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 {
 	struct topic_event *event;
 	int ret = 0;
 	struct topic_content content;
+
 	if (list_empty(&ref->event_queue))
 		return -EFAULT;
 
@@ -190,7 +230,6 @@ static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 	put_user(event->size, &content_u->data_size);
 	put_user(ref->target, &content_u->target.ptr);
 	if (copy_to_user(content.data, event->data, event->size)) {
-		// return ERR_PTR(-EFAULT);
 		ret = -EFAULT;
 	}
 	list_del(&event->list);
@@ -201,46 +240,64 @@ static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 }
 
 // 发布主题数据函数
-int publish_topic_data(struct topic_struct *topic, struct topic_content *content)
+static int publish_topic_data(struct topic_struct *topic, struct topic_content *content)
 {
 	struct topic_ref *ref;
 	int size = topic->data_size;
+
 	if (!topic) {
+		printk(KERN_ERR "publish_topic_data: Topic does not exist\n");
 		return -EINVAL;	 // 主题不存在错误码
 	}
 	if (topic->owner != current->pid) {
+		printk(KERN_ERR "publish_topic_data: Not the owner of the topic, permission denied\n");
 		return -EPERM;	// 非主题创建者无权发布错误码
 	}
 	if (content->data_size < topic->data_size) {
 		size = content->data_size;
 	}
+
 	// 释放旧数据内存（如果有）并更新为新数据
 	kfree(topic->last_data);
-	topic->last_data = memdup_user(content->data, size);
+	topic->last_data = safe_memdup_user(content->data, size);
+	if (!topic->last_data) {
+		printk(KERN_ERR "publish_topic_data: Failed to update topic data\n");
+		return -ENOMEM;
+	}
 
 	list_for_each_entry(ref, &topic->subscribers, list)
 	{
 		if (ref->topic) {
-			put_event(ref, content);
+			int put_event_ret = put_event(ref, content);
+			if (put_event_ret != 0) {
+				printk(KERN_ERR "publish_topic_data: Failed to put event for subscriber\n");
+				return put_event_ret;
+			}
 			wake_up_interruptible(&ref->proc->wait);
 		}
 	}
+
 	return 0;  // 发布成功
 }
 
 // 删除主题函数
-int delete_topic(struct topic_struct *topic)
+static int delete_topic(struct topic_struct *topic)
 {
 	struct topic_ref *ref;
+
 	if (!topic) {
+		printk(KERN_ERR "delete_topic: Topic does not exist\n");
 		return -EINVAL;	 // 主题不存在错误码
 	}
 	if (topic->owner != current->pid) {
+		printk(KERN_ERR "delete_topic: Not the owner of the topic, permission denied\n");
 		return -EPERM;	// 非主题创建者无权删除错误码
 	}
+
 	// 释放主题相关资源（如名称字符串等内存）
 	kfree(topic->topic_name);
 	kfree(topic->auth_scope);
+
 	// 通知订阅进程主题已删除（可选择合适方式通知）
 	list_for_each_entry(ref, &topic->subscribers, list)
 	{
@@ -248,10 +305,12 @@ int delete_topic(struct topic_struct *topic)
 			wake_up_interruptible(&ref->proc->wait);
 		}
 	}
+
 	// 从内核主题列表移除主题
 	list_del(&topic->list);
-	list_del(&topic->list);
+	list_del(&topic->list_p);
 	kfree(topic);
+
 	return 0;  // 删除成功
 }
 
@@ -260,12 +319,15 @@ static int topic_open(struct inode *nodp, struct file *filp)
 	struct topic_proc *proc;
 
 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
-	if (proc == NULL)
+	if (proc == NULL) {
+		printk(KERN_ERR "topic_open: Failed to allocate memory for topic_proc\n");
 		return -ENOMEM;
+	}
 	INIT_LIST_HEAD(&proc->topics);
 	INIT_LIST_HEAD(&proc->topic_refs);
 	INIT_LIST_HEAD(&proc->todo);
 	init_waitqueue_head(&proc->wait);
+
 	mutex_lock(&topic_lock);
 	proc->pid = current->group_leader->pid;
 	filp->private_data = proc;
@@ -278,7 +340,6 @@ static int topic_release(struct inode *nodp, struct file *filp)
 {
 	struct topic_proc *proc = filp->private_data;
 	// binder_defer_work(proc, BINDER_DEFERRED_RELEASE);
-
 	return 0;
 }
 
@@ -292,7 +353,7 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 
 static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	int ret;
+	int ret = 0;
 	struct topic_proc *proc = filp->private_data;
 	unsigned int size = _IOC_SIZE(cmd);
 	void __user *ubuf = (void __user *)arg;
@@ -303,36 +364,51 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		case IPC_TOPIC_CREATE: {
 			struct topic_mate tm;
 			struct topic_struct *topic;
-			struct topic_ref *ref;
+			// 检查参数大小是否合法
 			if (size != sizeof(struct topic_mate)) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_CREATE command\n");
+				break;
 			}
+			// 从用户空间复制数据
 			if (copy_from_user(&tm, ubuf, sizeof(tm))) {
 				ret = -EFAULT;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Failed to copy data for IPC_TOPIC_CREATE command\n");
+				break;
 			}
-			topic = (struct topic_struct *)create_topic(&tm, proc);
+			// 创建主题
+			topic = create_topic(&tm, proc);
+			if (!topic) {
+				ret = -ENOMEM;
+				printk(KERN_ERR "topic_ioctl: Failed to create topic for IPC_TOPIC_CREATE command\n");
+				break;
+			}
 			put_user(topic->handle, (int *)ubuf);
 			break;
 		}
 		case IPC_TOPIC_PUBLISH: {
-			int handle;
 			struct topic_struct *topic;
 			struct topic_content content;
 			if (size != sizeof(struct topic_content)) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_PUBLISH command\n");
+				break;
 			}
 			if (copy_from_user(&content, ubuf, sizeof(content))) {
 				ret = -EFAULT;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Failed to copy data for IPC_TOPIC_PUBLISH command\n");
+				break;
 			}
-			list_for_each_entry(topic, &proc->topics, list_p)
-			{
-				if (content.target.handle == topic->handle) {
-					publish_topic_data(topic, &content);
-				}
+			topic = find_topic_byid(proc, content.target.handle);
+			if (!topic) {
+				ret = -EINVAL;
+				printk(KERN_ERR "topic_ioctl: Topic not found for IPC_TOPIC_PUBLISH command\n");
+				break;
+			}
+			ret = publish_topic_data(topic, &content);
+			if (ret != 0) {
+				printk(KERN_ERR "topic_ioctl: Failed to publish topic data for IPC_TOPIC_PUBLISH command\n");
+				break;
 			}
 			break;
 		}
@@ -343,68 +419,83 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			char *topic_name;
 			if (size != sizeof(struct topic_subscribe)) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_SUBSCRIBE command\n");
+				break;
 			}
 			if (copy_from_user(&subscribe, ubuf, sizeof(subscribe))) {
 				ret = -EFAULT;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Failed to copy data for IPC_TOPIC_SUBSCRIBE command\n");
+				break;
 			}
 			topic_name = memdup_user(subscribe.topic_name, subscribe.name_size);
 			topic = find_topic_byname(topic_name);
 			kfree(topic_name);
 			if (!topic) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Topic not found for IPC_TOPIC_SUBSCRIBE command\n");
+				break;
 			}
 			ref = create_topic_ref(proc, topic, subscribe.target);
+			if (!ref) {
+				ret = -ENOMEM;
+				printk(KERN_ERR "topic_ioctl: Failed to create topic ref for IPC_TOPIC_SUBSCRIBE command\n");
+				break;
+			}
 			list_add_tail(&ref->list, &topic->subscribers);
 			break;
 		}
 		case IPC_TOPIC_DELETE: {
 			int handle;
-			struct topic_ref *ref;
 			struct topic_struct *topic;
 			if (size != sizeof(struct topic_content)) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_DELETE command\n");
+				break;
 			}
 			get_user(handle, (int __user *)ubuf);
 			list_for_each_entry(topic, &proc->topics, list_p)
 			{
 				if (handle == topic->handle) {
-					delete_topic(topic);
+					int delete_ret = delete_topic(topic);
+					if (delete_ret != 0) {
+						ret = delete_ret;
+						printk(KERN_ERR "topic_ioctl: Failed to delete topic for IPC_TOPIC_DELETE command\n");
+						break;
+					}
 				}
 			}
 			break;
 		}
 		case IPC_TOPIC_GET: {
-			int handle;
 			struct topic_ref *ref;
-			struct topic_struct *ts;
 			struct topic_content *content_u = (struct topic_content *)ubuf;
 
 			if (size != sizeof(struct topic_content)) {
 				ret = -EINVAL;
-				goto err;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_GET command\n");
+				break;
 			}
 
 			list_for_each_entry(ref, &proc->topic_refs, list)
 			{
-				if (get_event(ref, content_u) == 0)
+				int get_event_ret = get_event(ref, content_u);
+				if (get_event_ret == 0)
 					break;
+				else if (get_event_ret != -EFAULT) {  // 处理其他可能的错误情况
+					ret = get_event_ret;
+					printk(KERN_ERR "topic_ioctl: Failed to get event for IPC_TOPIC_GET command\n");
+					break;
+				}
 			}
 			break;
 		}
-		//case IPC_TOPIC_VERSION:
-		//	break;
 		default:
 			ret = -EINVAL;
-			goto err;
+			printk(KERN_ERR "topic_ioctl: Invalid command\n");
+			break;
 	}
-	ret = 0;
-err:
+
 	mutex_unlock(&topic_lock);
-	//wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
 	return ret;
 }
 
@@ -419,11 +510,7 @@ const struct file_operations topic_fops = {
 	.release = topic_release,
 };
 
-static struct miscdevice topic_miscdev = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name = "ipc_topic",
-	.fops = &topic_fops
-};
+static struct miscdevice topic_miscdev = {.minor = MISC_DYNAMIC_MINOR, .name = "ipc_topic", .fops = &topic_fops};
 
 static int __init topic_init(void)
 {
