@@ -27,40 +27,40 @@ struct topic_struct {
 	void *last_data;   // 主题最后一次发布的数据指针
 	struct topic_proc *proc;
 	struct list_head subscribers;  // 订阅该主题的进程链表头
-	struct list_head proc_list;	   // 用于在内核主题列表中链接该主题的节点
-	struct list_head list;		   // 用于在内核主题列表中链接该主题的节点
-	struct list_head list_p;	   // 用于在内核主题列表中链接该主题的节点
+	struct list_head proc_entry;	   // 加入进程 topics
+	struct list_head g_entry;		   // 加入全局 topic_head
 };
 
 struct topic_ref {
 	void *target;
+	int delete_flag;
 	struct topic_struct *topic;
 	struct topic_proc *proc;
-	struct list_head list;
+	struct list_head proc_entry;
+	struct list_head subscribe_entry;
 	struct list_head event_queue;
 };
 
 struct topic_proc {
-	// struct list_head threads;
-	struct list_head topics;
-	struct list_head topic_refs;
 	int pid;
 	int unique_id;
-	struct list_head todo;
 	wait_queue_head_t wait;
+	struct list_head topics;
+	struct list_head refs;
+	struct list_head delivered_death;
 };
 
 struct topic_event {
 	uint32_t type;
 	char *data;
 	int size;
-	struct list_head list;
+	struct list_head entry;
 };
 
 enum { IPC_TOPIC_PUBLISHER, IPC_TOPIC_SUBSCRIBER };
 
 // 全局主题列表头
-static struct list_head topic_list;
+static struct list_head topic_head;
 // 互斥锁保护主题相关操作
 static DEFINE_MUTEX(topic_lock);
 
@@ -79,8 +79,7 @@ static char *safe_memdup_user(const void __user *src, size_t size)
 static struct topic_struct *find_topic_byname(char *topic_name)
 {
 	struct topic_struct *topic;
-	list_for_each_entry(topic, &topic_list, list)
-	{
+	list_for_each_entry(topic, &topic_head, g_entry) {
 		if (!strcmp(topic_name, topic->topic_name)) {
 			return topic;
 		}
@@ -92,8 +91,7 @@ static struct topic_struct *find_topic_byname(char *topic_name)
 static struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
 {
 	struct topic_struct *topic;
-	list_for_each_entry(topic, &proc->topics, list_p)
-	{
+	list_for_each_entry(topic, &proc->topics, proc_entry) {
 		if (handle == topic->handle) {
 			return topic;
 		}
@@ -105,8 +103,7 @@ static struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
 static struct topic_ref *find_ref_byname(struct topic_proc *proc, char *topic_name)
 {
 	struct topic_ref *ref;
-	list_for_each_entry(ref, &proc->topic_refs, list)
-	{
+	list_for_each_entry(ref, &proc->refs, proc_entry) {
 		if (ref->topic && !strcmp(topic_name, ref->topic->topic_name)) {
 			return ref;
 		}
@@ -157,8 +154,8 @@ static struct topic_struct *create_topic(struct topic_mate *tm, struct topic_pro
 	new_topic->proc = proc;
 
 	// 将主题添加到内核主题列表（假设存在全局主题列表头 topic_list）
-	list_add_tail(&new_topic->list, &topic_list);
-	list_add_tail(&new_topic->list_p, &proc->topics);
+	list_add_tail(&new_topic->g_entry, &topic_head);
+	list_add_tail(&new_topic->proc_entry, &proc->topics);
 
 	return new_topic;
 }
@@ -178,10 +175,11 @@ static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_
 		return NULL;  // 返回内存不足错误码
 	}
 
+	ref->delete_flag = 0;
 	ref->topic = topic;
 	ref->proc = proc;
 	ref->target = ptr;
-	list_add_tail(&ref->list, &proc->topic_refs);
+	list_add_tail(&ref->proc_entry, &proc->refs);
 
 	return ref;
 }
@@ -206,7 +204,7 @@ static int put_event(struct topic_ref *ref, struct topic_content *content)
 	}
 	event->size = content->data_size;
 
-	list_add_tail(&event->list, &ref->event_queue);
+	list_add_tail(&event->entry, &ref->event_queue);
 
 	return 0;
 }
@@ -225,14 +223,14 @@ static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 		return -EFAULT;
 	}
 
-	event = list_first_entry(&ref->event_queue, struct topic_event, list);
+	event = list_first_entry(&ref->event_queue, struct topic_event, entry);
 	put_user(event->type, &content_u->type);
 	put_user(event->size, &content_u->data_size);
 	put_user(ref->target, &content_u->target.ptr);
 	if (copy_to_user(content.data, event->data, event->size)) {
 		ret = -EFAULT;
 	}
-	list_del(&event->list);
+	list_del(&event->entry);
 	kfree(event->data);
 	kfree(event);
 
@@ -265,8 +263,7 @@ static int publish_topic_data(struct topic_struct *topic, struct topic_content *
 		return -ENOMEM;
 	}
 
-	list_for_each_entry(ref, &topic->subscribers, list)
-	{
+	list_for_each_entry(ref, &topic->subscribers, subscribe_entry) {
 		if (ref->topic) {
 			int put_event_ret = put_event(ref, content);
 			if (put_event_ret != 0) {
@@ -283,7 +280,7 @@ static int publish_topic_data(struct topic_struct *topic, struct topic_content *
 // 删除主题函数
 static int delete_topic(struct topic_struct *topic)
 {
-	struct topic_ref *ref;
+	struct topic_ref *ref, *tmp;
 
 	if (!topic) {
 		printk(KERN_ERR "delete_topic: Topic does not exist\n");
@@ -294,21 +291,21 @@ static int delete_topic(struct topic_struct *topic)
 		return -EPERM;	// 非主题创建者无权删除错误码
 	}
 
-	// 释放主题相关资源（如名称字符串等内存）
-	kfree(topic->topic_name);
-	kfree(topic->auth_scope);
-
 	// 通知订阅进程主题已删除（可选择合适方式通知）
-	list_for_each_entry(ref, &topic->subscribers, list)
-	{
+	list_for_each_entry_safe(ref, tmp, &topic->subscribers, subscribe_entry) {
+		list_del(&ref->subscribe_entry);
+		list_del(&ref->proc_entry);
+		list_add_tail(&ref->proc_entry, &ref->proc->delivered_death);
 		if (ref->topic) {
 			wake_up_interruptible(&ref->proc->wait);
 		}
 	}
 
-	// 从内核主题列表移除主题
-	list_del(&topic->list);
-	list_del(&topic->list_p);
+	list_del(&topic->proc_entry);
+	list_del(&topic->g_entry);
+	kfree(topic->topic_name);
+	kfree(topic->auth_scope);
+	kfree(topic->last_data);
 	kfree(topic);
 
 	return 0;  // 删除成功
@@ -324,8 +321,8 @@ static int topic_open(struct inode *nodp, struct file *filp)
 		return -ENOMEM;
 	}
 	INIT_LIST_HEAD(&proc->topics);
-	INIT_LIST_HEAD(&proc->topic_refs);
-	INIT_LIST_HEAD(&proc->todo);
+	INIT_LIST_HEAD(&proc->refs);
+	INIT_LIST_HEAD(&proc->delivered_death);
 	init_waitqueue_head(&proc->wait);
 
 	mutex_lock(&topic_lock);
@@ -339,16 +336,53 @@ static int topic_open(struct inode *nodp, struct file *filp)
 static int topic_release(struct inode *nodp, struct file *filp)
 {
 	struct topic_proc *proc = filp->private_data;
-	// binder_defer_work(proc, BINDER_DEFERRED_RELEASE);
+	struct topic_struct *topic, *tmp;
+	struct topic_ref *ref, *tmp_ref;
+	struct topic_event *event, *event_ref;
+	list_for_each_entry_safe(topic, tmp, &proc->topics, proc_entry) {
+		int delete_ret = delete_topic(topic);
+		if (delete_ret != 0) {
+			printk(KERN_ERR "topic_release: Failed to delete topic\n");
+		}
+	}
+
+	list_for_each_entry_safe(ref, tmp_ref, &proc->refs, proc_entry) {
+		list_del(&ref->subscribe_entry);
+		list_del(&ref->proc_entry);
+		list_for_each_entry_safe(event , event_ref, &ref->event_queue, entry) {
+			list_del(&event->entry);
+			kfree(event->data);
+			kfree(event);
+		}
+		kfree(ref);
+	}
+
+	kfree(proc);
+
 	return 0;
 }
 
 static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait)
 {
 	struct topic_proc *proc = filp->private_data;
+	struct topic_ref *ref;
+	struct topic_event *event, *tmp;
 
 	poll_wait(filp, &proc->wait, wait);
-	return 0;
+
+	if(!list_empty(&proc->delivered_death)) {
+		list_for_each_entry(ref, &proc->delivered_death, proc_entry) {
+			list_del(&ref->proc_entry);
+			list_for_each_entry_safe(event, tmp, &ref->event_queue, entry) {
+				list_del(&event->entry);
+				kfree(event->data);
+				kfree(event);
+			}
+			kfree(ref);
+		}
+		return 0;
+	}
+	return POLLIN | POLLRDNORM;;
 }
 
 static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -441,7 +475,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				printk(KERN_ERR "topic_ioctl: Failed to create topic ref for IPC_TOPIC_SUBSCRIBE command\n");
 				break;
 			}
-			list_add_tail(&ref->list, &topic->subscribers);
+			list_add_tail(&ref->subscribe_entry, &topic->subscribers);
 			break;
 		}
 		case IPC_TOPIC_DELETE: {
@@ -453,8 +487,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 			get_user(handle, (int __user *)ubuf);
-			list_for_each_entry(topic, &proc->topics, list_p)
-			{
+			list_for_each_entry(topic, &proc->topics, proc_entry) {
 				if (handle == topic->handle) {
 					int delete_ret = delete_topic(topic);
 					if (delete_ret != 0) {
@@ -476,8 +509,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 
-			list_for_each_entry(ref, &proc->topic_refs, list)
-			{
+			list_for_each_entry(ref, &proc->refs, proc_entry) {
 				int get_event_ret = get_event(ref, content_u);
 				if (get_event_ret == 0)
 					break;
