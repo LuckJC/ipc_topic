@@ -3,13 +3,22 @@
  * Copyright (C) 2020 Unisoc Inc.
  */
 
-#include "asm/string.h"
-#include "asm/uaccess.h"
-#include "linux/list.h"
-#include "linux/wait.h"
+#include <linux/mm.h>
+#include <asm/string.h>
+#include <asm/uaccess.h>
+#include <linux/wait.h>
 #include <linux/init.h>
 #include <linux/module.h>
-// #include<linux/moduleparam.h>
+#include <linux/uaccess.h>
+#include <linux/list.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/poll.h>
+
+#include "ipc_topic.h"
 
 // 主题结构体定义
 struct topic_struct {
@@ -30,6 +39,7 @@ struct topic_struct {
 struct topic_ref {
 	void *target;
 	struct topic_struct *topic;
+	struct topic_proc *proc;
 	struct list_head list;
 	struct list_head event_queue;
 };
@@ -80,7 +90,7 @@ struct topic_struct *find_topic_byid(struct topic_proc *proc, int handle)
 	return NULL;
 }
 
-struct topic_struct *find_ref_byname(struct topic_proc *proc, char *topic_name)
+static struct topic_ref *find_ref_byname(struct topic_proc *proc, char *topic_name)
 {
 	struct topic_ref *ref;
 	list_for_each_entry(ref, &proc->topic_refs, list)
@@ -92,25 +102,13 @@ struct topic_struct *find_ref_byname(struct topic_proc *proc, char *topic_name)
 	return NULL;
 }
 
-struct topic_struct *find_ref_byid(struct topic_proc *proc, int handle)
-{
-	struct topic_ref *ref;
-	list_for_each_entry(ref, &proc->topic_refs, list)
-	{
-		if (ref->topic && handle == ref->target.handle) {
-			return ref;
-		}
-	}
-	return NULL;
-}
-
 // 创建主题函数
-int create_topic(struct topic_mate *tm, struct topic_proc *proc)
+static int create_topic(struct topic_mate *tm, struct topic_proc *proc)
 {
 	char *topic_name;
 	// 分配主题结构体内存空间
 	struct topic_struct *new_topic;
-	topic_name = memdup_user(tm->topic_name, tm->name_size);
+	topic_name = (char *)memdup_user(tm->topic_name, tm->name_size);
 	new_topic = find_topic_byname(topic_name);
 	if (new_topic) {
 		kfree(new_topic);
@@ -123,10 +121,10 @@ int create_topic(struct topic_mate *tm, struct topic_proc *proc)
 	}
 	new_topic->handle = proc->unique_id++;
 	// 初始化主题名称等属性
-	new_topic->topic_name = memdup_user(tm->topic_name, tm->name_size);
+	new_topic->topic_name = (char *)memdup_user(tm->topic_name, tm->name_size);
 	new_topic->data_type = tm->data_type;
 	new_topic->data_size = tm->data_size;
-	new_topic->owner = current->uid;  // 当前进程作为主题创建者
+	new_topic->owner = current->pid;  // 当前进程作为主题创建者
 	new_topic->auth_scope = memdup_user(tm->auth_scope, tm->auth_size);
 	// 初始化订阅者链表等
 	INIT_LIST_HEAD(&new_topic->subscribers);
@@ -138,13 +136,13 @@ int create_topic(struct topic_mate *tm, struct topic_proc *proc)
 	return (int)new_topic;	// 返回主题结构体指针（可转换为整数便于上层使用）
 }
 
-int create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr)
+static int create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr)
 {
 	// 分配主题结构体内存空间
 	struct topic_ref *ref;
-	ref = find_ref_byname(topic, topic->topic_name);
+	ref = find_ref_byname(proc, topic->topic_name);
 	if (ref)
-		return ref;
+		return (int)ref;
 
 	ref = kmalloc(sizeof(struct topic_ref), GFP_KERNEL);
 	if (!ref) {
@@ -152,13 +150,14 @@ int create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *
 	}
 	// 初始化主题名称等属性
 	ref->topic = topic;
+	ref->proc = proc;
 	ref->target = ptr;
 	list_add_tail(&ref->list, &proc->topic_refs);
 
 	return (int)ref;  // 返回主题结构体指针（可转换为整数便于上层使用）
 }
 
-int put_event(struct topic_ref *ref, struct topic_content *content)
+static int put_event(struct topic_ref *ref, struct topic_content *content)
 {
 	struct topic_event *event;
 	event = kmalloc(sizeof(struct topic_event), GFP_KERNEL);
@@ -166,56 +165,39 @@ int put_event(struct topic_ref *ref, struct topic_content *content)
 		return -ENOMEM;	 // 返回内存不足错误码
 	}
 	event->type = content->type;
-	event->data = memdup_user(event->data, content->size);
+	event->data = memdup_user(event->data, content->data_size);
 	event->size = content->data_size;
 
-	list_add_tail(event->list, ref->event_queue);
+	list_add_tail(&event->list, &ref->event_queue);
 
 	return (int)event;
 }
 
-int get_event(struct topic_ref *ref, struct topic_content *content_u)
+static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 {
 	struct topic_event *event;
 	int ret = 0;
 	struct topic_content content;
-	if (list_empty(ref->event_queue))
+	if (list_empty(&ref->event_queue))
 		return -EFAULT;
 
 	if (copy_from_user(&content, content_u, sizeof(content))) {
 		return -EFAULT;
 	}
 
-	event = list_first_entry(ref->event_queue, struct topic_event, list);
+	event = list_first_entry(&ref->event_queue, struct topic_event, list);
 	put_user(event->type, &content_u->type);
 	put_user(event->size, &content_u->data_size);
 	put_user(ref->target, &content_u->target.ptr);
-	if (copy_to_user(content->data, event->data, event->size)) {
+	if (copy_to_user(content.data, event->data, event->size)) {
 		// return ERR_PTR(-EFAULT);
 		ret = -EFAULT;
 	}
-	list_del(event);
+	list_del(&event->list);
 	kfree(event->data);
 	kfree(event);
 
 	return ret;
-}
-
-// 订阅主题函数
-int subscribe_topic(int topic_id, struct task_struct *current)
-{
-	/*struct topic_struct *topic = (struct topic_struct *)topic_id;
-	if (!topic) {
-		return -EINVAL;	 // 主题不存在错误码
-	}
-	// 检查授权范围，如比较当前进程所属用户组等与主题授权范围
-	if (!check_auth(topic, current)) {
-		return -EPERM;	// 无权限订阅错误码
-	}
-	// 将当前进程添加到订阅者链表
-	list_add_tail(&current->topic_subscription_node, &topic->subscribers);*/
-	struct topic_event *event;
-	return 0;  // 订阅成功
 }
 
 // 发布主题数据函数
@@ -226,7 +208,7 @@ int publish_topic_data(struct topic_struct *topic, struct topic_content *content
 	if (!topic) {
 		return -EINVAL;	 // 主题不存在错误码
 	}
-	if (topic->owner != current->uid) {
+	if (topic->owner != current->pid) {
 		return -EPERM;	// 非主题创建者无权发布错误码
 	}
 	if (content->data_size < topic->data_size) {
@@ -240,37 +222,22 @@ int publish_topic_data(struct topic_struct *topic, struct topic_content *content
 	{
 		if (ref->topic) {
 			put_event(ref, content);
-			wake_up_interruptible(&ref->topic->proc->wait);
+			wake_up_interruptible(&ref->proc->wait);
 		}
 	}
 	return 0;  // 发布成功
 }
 
-// 获取主题数据函数
-void *get_topic_data(int topic_id, struct task_struct *current)
-{
-	struct topic_struct *topic = (struct topic_struct *)topic_id;
-	if (!topic) {
-		return NULL;  // 主题不存在
-	}
-	// 检查当前进程是否订阅该主题
-	/*if (!is_subscribed(topic, current)) {
-		return NULL;  // 未订阅不能获取数据
-	}*/
-	return topic->last_data;
-}
-
 // 删除主题函数
 int delete_topic(struct topic_struct *topic)
 {
+	struct topic_ref *ref;
 	if (!topic) {
 		return -EINVAL;	 // 主题不存在错误码
 	}
-	if (topic->owner != current->uid) {
+	if (topic->owner != current->pid) {
 		return -EPERM;	// 非主题创建者无权删除错误码
 	}
-	// 标记主题为已删除（可通过设置标志位等方式）
-	topic->deleted = 1;
 	// 释放主题相关资源（如名称字符串等内存）
 	kfree(topic->topic_name);
 	kfree(topic->auth_scope);
@@ -278,7 +245,7 @@ int delete_topic(struct topic_struct *topic)
 	list_for_each_entry(ref, &topic->subscribers, list)
 	{
 		if (ref->topic) {
-			wake_up_interruptible(&ref->topic->proc->wait);
+			wake_up_interruptible(&ref->proc->wait);
 		}
 	}
 	// 从内核主题列表移除主题
@@ -335,7 +302,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 		case IPC_TOPIC_CREATE: {
 			struct topic_mate tm;
-			struct topic_struct *ts;
+			struct topic_struct *topic;
 			struct topic_ref *ref;
 			if (size != sizeof(struct topic_mate)) {
 				ret = -EINVAL;
@@ -345,8 +312,8 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = -EFAULT;
 				goto err;
 			}
-			ts = create_topic(&tm, proc);
-			put_user(ubuf, ts->handle);
+			topic = (struct topic_struct *)create_topic(&tm, proc);
+			put_user(topic->handle, (int *)ubuf);
 			break;
 		}
 		case IPC_TOPIC_PUBLISH: {
@@ -428,20 +395,16 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 			break;
 		}
-		case IPC_TOPIC_VERSION:
-			break;
+		//case IPC_TOPIC_VERSION:
+		//	break;
 		default:
 			ret = -EINVAL;
 			goto err;
 	}
 	ret = 0;
 err:
-	if (thread)
-		thread->looper &= ~BINDER_LOOPER_STATE_NEED_RETURN;
 	mutex_unlock(&topic_lock);
-	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
-	if (ret && ret != -ERESTARTSYS)
-		printk(KERN_INFO "binder: %d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
+	//wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
 	return ret;
 }
 
@@ -456,7 +419,11 @@ const struct file_operations topic_fops = {
 	.release = topic_release,
 };
 
-static struct miscdevice topic_miscdev = {.minor = MISC_DYNAMIC_MINOR, .name = "ipc_topic", .fops = &topic_fops};
+static struct miscdevice topic_miscdev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "ipc_topic",
+	.fops = &topic_fops
+};
 
 static int __init topic_init(void)
 {
