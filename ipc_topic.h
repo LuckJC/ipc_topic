@@ -1,7 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Copyright (C) 2020 Unisoc Inc.
- */
 
 #ifndef _IPC_TOPIC_H_
 #define _IPC_TOPIC_H_

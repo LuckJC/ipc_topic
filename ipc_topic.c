@@ -1,10 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Copyright (C) 2020 Unisoc Inc.
- */
 
-#include <asm/string.h>
-#include <asm/uaccess.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -28,7 +23,7 @@ struct topic_struct {
 	struct topic_proc *proc;
 	struct list_head subscribers;  // 订阅该主题的进程链表头
 	struct list_head proc_entry;	   // 加入进程 topics
-	struct list_head g_entry;		   // 加入全局 topic_head
+	struct list_head g_entry;		   // 加入全局 g_topic_head
 };
 
 struct topic_ref {
@@ -60,7 +55,7 @@ struct topic_event {
 enum { IPC_TOPIC_PUBLISHER, IPC_TOPIC_SUBSCRIBER };
 
 // 全局主题列表头
-static struct list_head topic_head;
+static struct list_head g_topic_head;
 // 互斥锁保护主题相关操作
 static DEFINE_MUTEX(topic_lock);
 
@@ -79,7 +74,7 @@ static char *safe_memdup_user(const void __user *src, size_t size)
 static struct topic_struct *find_topic_byname(char *topic_name)
 {
 	struct topic_struct *topic;
-	list_for_each_entry(topic, &topic_head, g_entry) {
+	list_for_each_entry(topic, &g_topic_head, g_entry) {
 		if (!strcmp(topic_name, topic->topic_name)) {
 			return topic;
 		}
@@ -154,7 +149,7 @@ static struct topic_struct *create_topic(struct topic_mate *tm, struct topic_pro
 	new_topic->proc = proc;
 
 	// 将主题添加到内核主题列表（假设存在全局主题列表头 topic_list）
-	list_add_tail(&new_topic->g_entry, &topic_head);
+	list_add_tail(&new_topic->g_entry, &g_topic_head);
 	list_add_tail(&new_topic->proc_entry, &proc->topics);
 
 	return new_topic;
@@ -552,6 +547,9 @@ static int __init topic_init(void)
 	if (ret < 0) {
 		return ret;
 	}
+
+	INIT_LIST_HEAD(&g_topic_head);
+
 	return 0;
 }
 
