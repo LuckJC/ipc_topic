@@ -39,6 +39,7 @@ struct topic_ref {
 struct topic_proc {
 	int pid;
 	int unique_id;
+	int event_count;
 	wait_queue_head_t wait;
 	struct list_head topics;
 	struct list_head refs;
@@ -51,8 +52,6 @@ struct topic_event {
 	int size;
 	struct list_head entry;
 };
-
-enum { IPC_TOPIC_PUBLISHER, IPC_TOPIC_SUBSCRIBER };
 
 // 全局主题列表头
 static struct list_head g_topic_head;
@@ -161,8 +160,10 @@ static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_
 	struct topic_ref *ref;
 
 	ref = find_ref_byname(proc, topic->topic_name);
-	if (ref)
+	if (ref) {
+		pr_debug("ref already exist, use it.");
 		return ref;
+	}
 
 	ref = kmalloc(sizeof(struct topic_ref), GFP_KERNEL);
 	if (!ref) {
@@ -174,6 +175,7 @@ static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_
 	ref->topic = topic;
 	ref->proc = proc;
 	ref->target = ptr;
+	INIT_LIST_HEAD(&ref->event_queue);
 	list_add_tail(&ref->proc_entry, &proc->refs);
 
 	return ref;
@@ -198,7 +200,7 @@ static int put_event(struct topic_ref *ref, struct topic_content *content)
 		return -ENOMEM;
 	}
 	event->size = content->data_size;
-
+	ref->proc->event_count++;
 	list_add_tail(&event->entry, &ref->event_queue);
 
 	return 0;
@@ -212,7 +214,7 @@ static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 	struct topic_content content;
 
 	if (list_empty(&ref->event_queue))
-		return -EFAULT;
+		return -ENOENT;
 
 	if (copy_from_user(&content, content_u, sizeof(content))) {
 		return -EFAULT;
@@ -225,6 +227,7 @@ static int get_event(struct topic_ref *ref, struct topic_content *content_u)
 	if (copy_to_user(content.data, event->data, event->size)) {
 		ret = -EFAULT;
 	}
+	ref->proc->event_count--;
 	list_del(&event->entry);
 	kfree(event->data);
 	kfree(event);
@@ -318,6 +321,7 @@ static int topic_open(struct inode *nodp, struct file *filp)
 	INIT_LIST_HEAD(&proc->topics);
 	INIT_LIST_HEAD(&proc->refs);
 	INIT_LIST_HEAD(&proc->delivered_death);
+	proc->event_count = 0;
 	init_waitqueue_head(&proc->wait);
 
 	mutex_lock(&topic_lock);
@@ -377,7 +381,12 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 		}
 		return 0;
 	}
-	return POLLIN | POLLRDNORM;;
+
+	if(proc->event_count > 0) {
+		return POLLIN | POLLRDNORM;
+	}
+
+	return 0;
 }
 
 static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -388,6 +397,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void __user *ubuf = (void __user *)arg;
 
 	mutex_lock(&topic_lock);
+	pr_debug("cmd:%d\n", _IOC_NR(cmd));
 
 	switch (cmd) {
 		case IPC_TOPIC_CREATE: {
@@ -456,21 +466,45 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				printk(KERN_ERR "topic_ioctl: Failed to copy data for IPC_TOPIC_SUBSCRIBE command\n");
 				break;
 			}
-			topic_name = memdup_user(subscribe.topic_name, subscribe.name_size);
+			topic_name = safe_memdup_user(subscribe.topic_name, subscribe.name_size);
 			topic = find_topic_byname(topic_name);
-			kfree(topic_name);
 			if (!topic) {
 				ret = -EINVAL;
-				printk(KERN_ERR "topic_ioctl: Topic not found for IPC_TOPIC_SUBSCRIBE command\n");
+				printk(KERN_ERR "topic_ioctl: Topic [%s] not found for IPC_TOPIC_SUBSCRIBE command\n", topic_name);
+				kfree(topic_name);
 				break;
 			}
 			ref = create_topic_ref(proc, topic, subscribe.target);
 			if (!ref) {
 				ret = -ENOMEM;
-				printk(KERN_ERR "topic_ioctl: Failed to create topic ref for IPC_TOPIC_SUBSCRIBE command\n");
+				printk(KERN_ERR "topic_ioctl: Failed to create topic [%s] ref for IPC_TOPIC_SUBSCRIBE command\n", topic_name);
+				kfree(topic_name);
 				break;
 			}
 			list_add_tail(&ref->subscribe_entry, &topic->subscribers);
+			kfree(topic_name);
+			break;
+		}
+		case IPC_TOPIC_GET: {
+			struct topic_ref *ref;
+			struct topic_content *content_u = (struct topic_content *)ubuf;
+
+			if (size != sizeof(struct topic_content)) {
+				ret = -EINVAL;
+				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_GET command\n");
+				break;
+			}
+
+			if(proc->event_count == 0) {
+				ret = -ENOENT;
+				break;
+			}
+
+			list_for_each_entry(ref, &proc->refs, proc_entry) {
+				ret = get_event(ref, content_u);
+				if (ret == 0) 
+					break;
+			}
 			break;
 		}
 		case IPC_TOPIC_DELETE: {
@@ -490,28 +524,6 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						printk(KERN_ERR "topic_ioctl: Failed to delete topic for IPC_TOPIC_DELETE command\n");
 						break;
 					}
-				}
-			}
-			break;
-		}
-		case IPC_TOPIC_GET: {
-			struct topic_ref *ref;
-			struct topic_content *content_u = (struct topic_content *)ubuf;
-
-			if (size != sizeof(struct topic_content)) {
-				ret = -EINVAL;
-				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_GET command\n");
-				break;
-			}
-
-			list_for_each_entry(ref, &proc->refs, proc_entry) {
-				int get_event_ret = get_event(ref, content_u);
-				if (get_event_ret == 0)
-					break;
-				else if (get_event_ret != -EFAULT) {  // 处理其他可能的错误情况
-					ret = get_event_ret;
-					printk(KERN_ERR "topic_ioctl: Failed to get event for IPC_TOPIC_GET command\n");
-					break;
 				}
 			}
 			break;
