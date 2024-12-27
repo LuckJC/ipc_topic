@@ -98,7 +98,7 @@ int main(int argc, char *argv[])
 
 	// 使用ioctl调用内核模块的发布主题数据功能（假设IPC_TOPIC_CREATE是对应的命令）
 	perform_ioctl(fd, IPC_TOPIC_CREATE, &mate);
-	content.target.handle = *((int*)&mate);
+	content.target.handle = *((int *)&mate);
 
 	while (1) {
 		// 获取要发布的主题数据（从用户输入）
@@ -112,7 +112,6 @@ int main(int argc, char *argv[])
 		data_size = strlen(topic_data) + 1;
 
 		// 填充要发布的主题内容结构体
-		//content.target.handle = 0;	// 根据内核模块要求合理设置，这里暂时设为0
 		content.data = topic_data;
 		content.data_size = data_size;
 

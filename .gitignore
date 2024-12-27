@@ -12,3 +12,6 @@ Module.symvers
 .Module.symvers.cmd
 .cache/
 compile_commands.json
+test/publisher
+test/subscriber
+
