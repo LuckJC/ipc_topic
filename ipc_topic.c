@@ -364,15 +364,15 @@ static int topic_release(struct inode *nodp, struct file *filp)
 static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait)
 {
 	struct topic_proc *proc = filp->private_data;
-	struct topic_ref *ref;
-	struct topic_event *event, *tmp;
+	struct topic_ref *ref, *n_ref;
+	struct topic_event *event, *n_event;
 
 	poll_wait(filp, &proc->wait, wait);
 
 	if(!list_empty(&proc->delivered_death)) {
-		list_for_each_entry(ref, &proc->delivered_death, proc_entry) {
+		list_for_each_entry_safe(ref, n_ref, &proc->delivered_death, proc_entry) {
 			list_del(&ref->proc_entry);
-			list_for_each_entry_safe(event, tmp, &ref->event_queue, entry) {
+			list_for_each_entry_safe(event, n_event, &ref->event_queue, entry) {
 				list_del(&event->entry);
 				kfree(event->data);
 				kfree(event);
