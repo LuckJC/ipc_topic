@@ -278,7 +278,7 @@ static int publish_topic_data(struct topic_struct *topic, struct topic_content *
 // 删除主题函数
 static int delete_topic(struct topic_struct *topic)
 {
-	struct topic_ref *ref, *tmp;
+	struct topic_ref *ref, *n_ref;
 
 	if (!topic) {
 		printk(KERN_ERR "delete_topic: Topic does not exist\n");
@@ -290,7 +290,7 @@ static int delete_topic(struct topic_struct *topic)
 	}
 
 	// 通知订阅进程主题已删除（可选择合适方式通知）
-	list_for_each_entry_safe(ref, tmp, &topic->subscribers, subscribe_entry) {
+	list_for_each_entry_safe(ref, n_ref, &topic->subscribers, subscribe_entry) {
 		list_del(&ref->subscribe_entry);
 		list_del(&ref->proc_entry);
 		list_add_tail(&ref->proc_entry, &ref->proc->delivered_death);
@@ -335,20 +335,22 @@ static int topic_open(struct inode *nodp, struct file *filp)
 static int topic_release(struct inode *nodp, struct file *filp)
 {
 	struct topic_proc *proc = filp->private_data;
-	struct topic_struct *topic, *tmp;
-	struct topic_ref *ref, *tmp_ref;
-	struct topic_event *event, *event_ref;
-	list_for_each_entry_safe(topic, tmp, &proc->topics, proc_entry) {
+	struct topic_struct *topic, *n_topic;
+	struct topic_ref *ref, *n_ref;
+	struct topic_event *event, *n_event;
+
+	mutex_lock(&topic_lock);
+	list_for_each_entry_safe(topic, n_topic, &proc->topics, proc_entry) {
 		int delete_ret = delete_topic(topic);
 		if (delete_ret != 0) {
 			printk(KERN_ERR "topic_release: Failed to delete topic\n");
 		}
 	}
 
-	list_for_each_entry_safe(ref, tmp_ref, &proc->refs, proc_entry) {
+	list_for_each_entry_safe(ref, n_ref, &proc->refs, proc_entry) {
 		list_del(&ref->subscribe_entry);
 		list_del(&ref->proc_entry);
-		list_for_each_entry_safe(event , event_ref, &ref->event_queue, entry) {
+		list_for_each_entry_safe(event , n_event, &ref->event_queue, entry) {
 			list_del(&event->entry);
 			kfree(event->data);
 			kfree(event);
@@ -357,6 +359,7 @@ static int topic_release(struct inode *nodp, struct file *filp)
 	}
 
 	kfree(proc);
+	mutex_lock(&topic_lock);
 
 	return 0;
 }
@@ -369,6 +372,7 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 
 	poll_wait(filp, &proc->wait, wait);
 
+	mutex_lock(&topic_lock);
 	if(!list_empty(&proc->delivered_death)) {
 		list_for_each_entry_safe(ref, n_ref, &proc->delivered_death, proc_entry) {
 			list_del(&ref->proc_entry);
@@ -379,8 +383,10 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 			}
 			kfree(ref);
 		}
+		mutex_unlock(&topic_lock);
 		return 0;
 	}
+	mutex_unlock(&topic_lock);
 
 	if(proc->event_count > 0) {
 		return POLLIN | POLLRDNORM;
