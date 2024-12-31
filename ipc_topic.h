@@ -4,7 +4,10 @@
 #define _IPC_TOPIC_H_
 
 struct topic_mate {
-	char *topic_name;  // 主题名称
+	union {
+		int handle;
+		char *topic_name;  // 主题名称
+	};
 	int name_size;
 	int data_type;			  // 主题的数据类型，可自行定义枚举等方式表示不同类型
 	int data_size;			  // 主题的数据大小
