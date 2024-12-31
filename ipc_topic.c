@@ -557,6 +557,29 @@ const struct file_operations topic_fops = {
 
 static struct miscdevice topic_miscdev = {.minor = MISC_DYNAMIC_MINOR, .name = "ipc_topic", .fops = &topic_fops};
 
+static ssize_t debug_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	if (mutex_trylock(&topic_lock)) {
+		sprintf(buf, "unlocked\n");
+		mutex_unlock(&topic_lock);
+	} else {
+		sprintf(buf,"locked\n");
+	}
+	return strlen(buf);
+}
+
+static ssize_t debug_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	if(buf[0] == '0') {
+		mutex_unlock(&topic_lock);
+	} else if(buf[0] == '1') {
+		mutex_trylock(&topic_lock);
+	}
+	return count;
+}
+
+static DEVICE_ATTR(debug, S_IWUSR | S_IRUGO, debug_show, debug_store);
+
 static int __init topic_init(void)
 {
 	int ret;
@@ -566,6 +589,12 @@ static int __init topic_init(void)
 		return ret;
 	}
 
+	ret = device_create_file(topic_miscdev.this_device, &dev_attr_debug);
+	if(ret) {
+		misc_deregister(&topic_miscdev);
+		pr_err("device_create_file (%s) = %d\n", dev_attr_debug.attr.name, ret);
+	}
+
 	INIT_LIST_HEAD(&g_topic_head);
 
 	return 0;
@@ -573,6 +602,7 @@ static int __init topic_init(void)
 
 static void __exit topic_exit(void)
 {
+	device_remove_file(topic_miscdev.this_device, &dev_attr_debug);
 	misc_deregister(&topic_miscdev);
 }
 
