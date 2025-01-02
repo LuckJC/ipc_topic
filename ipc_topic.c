@@ -359,7 +359,7 @@ static int topic_release(struct inode *nodp, struct file *filp)
 	}
 
 	kfree(proc);
-	mutex_lock(&topic_lock);
+	mutex_unlock(&topic_lock);
 
 	return 0;
 }
