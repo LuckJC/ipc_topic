@@ -161,8 +161,8 @@ static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_
 
 	ref = find_ref_byname(proc, topic->topic_name);
 	if (ref) {
-		pr_debug("ref already exist, use it.");
-		return ref;
+		pr_notice("ref already exist, use it.");
+		return NULL;
 	}
 
 	ref = kmalloc(sizeof(struct topic_ref), GFP_KERNEL);
@@ -482,7 +482,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 			ref = create_topic_ref(proc, topic, subscribe.target);
 			if (!ref) {
-				ret = -ENOMEM;
+				ret = -EINVAL;
 				printk(KERN_ERR "topic_ioctl: Failed to create topic [%s] ref for IPC_TOPIC_SUBSCRIBE command\n", topic_name);
 				kfree(topic_name);
 				break;
