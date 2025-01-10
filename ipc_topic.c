@@ -462,6 +462,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			struct topic_ref *ref;
 			struct topic_struct *topic;
 			char *topic_name;
+			kuid_t uid = current_uid();
 			if (size != sizeof(struct topic_subscribe)) {
 				ret = -EINVAL;
 				printk(KERN_ERR "topic_ioctl: Invalid size for IPC_TOPIC_SUBSCRIBE command\n");
@@ -477,6 +478,12 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (!topic) {
 				ret = -EINVAL;
 				printk(KERN_ERR "topic_ioctl: Topic [%s] not found for IPC_TOPIC_SUBSCRIBE command\n", topic_name);
+				kfree(topic_name);
+				break;
+			}
+			if(strcmp(topic->auth_scope, "all") && from_kuid(&init_user_ns, uid) != simple_strtoul(topic->auth_scope, NULL, 10)) {
+				ret = -EPERM;
+				printk(KERN_ERR "topic_ioctl: subscribe %s permission denied! %d != %ld\n", topic_name, from_kuid(&init_user_ns, uid), simple_strtoul(topic->auth_scope, NULL, 10));
 				kfree(topic_name);
 				break;
 			}
