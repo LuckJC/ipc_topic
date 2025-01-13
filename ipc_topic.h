@@ -17,8 +17,8 @@ struct topic_mate {
 
 struct topic_content {
 	union {
-		int handle;
-		void *ptr;
+		int handle;		// 发布者使用
+		void *ptr;		// 订阅者使用
 	} target;
 	int type;
 	char *data;
@@ -28,7 +28,8 @@ struct topic_content {
 struct topic_subscribe {
 	char *topic_name;  // 主题名称
 	int name_size;
-	void *target;
+	void *target;		// 消息处理的对象
+	void *death_notifier; // 处理死亡通过的对象
 };
 
 #define IPC_TOPIC_CREATE		_IOWR('t', 1, struct topic_mate)
@@ -36,5 +37,6 @@ struct topic_subscribe {
 #define IPC_TOPIC_SUBSCRIBE		_IOW('t', 3, struct topic_subscribe)
 #define IPC_TOPIC_GET			_IOR('t', 4, struct topic_content)
 #define IPC_TOPIC_DELETE		_IOW('t', 5, __s64)
+#define IPC_TOPIC_GET_LEGACY	_IOR('t', 6, struct topic_content)
 
 #endif

@@ -19,7 +19,6 @@ struct topic_struct {
 	int data_size;	   // 主题的数据大小
 	pid_t owner;	   // 主题创建者的用户ID
 	char *auth_scope;  // 订阅授权范围（"none"、"all" 或具体用户组等）
-	void *last_data;   // 主题最后一次发布的数据指针
 	struct topic_proc *proc;
 	struct list_head subscribers;  // 订阅该主题的进程链表头
 	struct list_head proc_entry;	   // 加入进程 topics
@@ -28,7 +27,7 @@ struct topic_struct {
 
 struct topic_ref {
 	void *target;
-	int delete_flag;
+	void *death_notifier;
 	struct topic_struct *topic;
 	struct topic_proc *proc;
 	struct list_head proc_entry;
@@ -44,6 +43,7 @@ struct topic_proc {
 	struct list_head topics;
 	struct list_head refs;
 	struct list_head delivered_death;
+	struct list_head legacy_events;
 };
 
 struct topic_event {
@@ -144,7 +144,6 @@ static struct topic_struct *create_topic(struct topic_mate *tm, struct topic_pro
 		return NULL;
 	}
 	INIT_LIST_HEAD(&new_topic->subscribers);
-	new_topic->last_data = NULL;
 	new_topic->proc = proc;
 
 	// 将主题添加到内核主题列表（假设存在全局主题列表头 topic_list）
@@ -155,7 +154,7 @@ static struct topic_struct *create_topic(struct topic_mate *tm, struct topic_pro
 }
 
 // 创建主题引用
-static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr)
+static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_struct *topic, void *ptr, void *death_notifier)
 {
 	struct topic_ref *ref;
 
@@ -171,10 +170,10 @@ static struct topic_ref *create_topic_ref(struct topic_proc *proc, struct topic_
 		return NULL;  // 返回内存不足错误码
 	}
 
-	ref->delete_flag = 0;
 	ref->topic = topic;
 	ref->proc = proc;
 	ref->target = ptr;
+	ref->death_notifier = death_notifier;
 	INIT_LIST_HEAD(&ref->event_queue);
 	list_add_tail(&ref->proc_entry, &proc->refs);
 
@@ -253,14 +252,6 @@ static int publish_topic_data(struct topic_struct *topic, struct topic_content *
 		size = content->data_size;
 	}
 
-	// 释放旧数据内存（如果有）并更新为新数据
-	kfree(topic->last_data);
-	topic->last_data = safe_memdup_user(content->data, size);
-	if (!topic->last_data) {
-		printk(KERN_ERR "publish_topic_data: Failed to update topic data\n");
-		return -ENOMEM;
-	}
-
 	list_for_each_entry(ref, &topic->subscribers, subscribe_entry) {
 		if (ref->topic) {
 			int put_event_ret = put_event(ref, content);
@@ -279,6 +270,7 @@ static int publish_topic_data(struct topic_struct *topic, struct topic_content *
 static int delete_topic(struct topic_struct *topic)
 {
 	struct topic_ref *ref, *n_ref;
+	struct topic_event *event;
 
 	if (!topic) {
 		printk(KERN_ERR "delete_topic: Topic does not exist\n");
@@ -294,6 +286,9 @@ static int delete_topic(struct topic_struct *topic)
 		list_del(&ref->subscribe_entry);
 		list_del(&ref->proc_entry);
 		list_add_tail(&ref->proc_entry, &ref->proc->delivered_death);
+		list_for_each_entry(event, &ref->event_queue, entry) {
+			ref->proc->event_count--;
+		}
 		if (ref->topic) {
 			wake_up_interruptible(&ref->proc->wait);
 		}
@@ -303,7 +298,6 @@ static int delete_topic(struct topic_struct *topic)
 	list_del(&topic->g_entry);
 	kfree(topic->topic_name);
 	kfree(topic->auth_scope);
-	kfree(topic->last_data);
 	kfree(topic);
 
 	return 0;  // 删除成功
@@ -321,6 +315,7 @@ static int topic_open(struct inode *nodp, struct file *filp)
 	INIT_LIST_HEAD(&proc->topics);
 	INIT_LIST_HEAD(&proc->refs);
 	INIT_LIST_HEAD(&proc->delivered_death);
+	INIT_LIST_HEAD(&proc->legacy_events);
 	proc->event_count = 0;
 	init_waitqueue_head(&proc->wait);
 
@@ -358,6 +353,17 @@ static int topic_release(struct inode *nodp, struct file *filp)
 		kfree(ref);
 	}
 
+	list_for_each_entry_safe(ref, n_ref, &proc->delivered_death, proc_entry) {
+		list_del(&ref->subscribe_entry);
+		list_del(&ref->proc_entry);
+		list_for_each_entry_safe(event , n_event, &ref->event_queue, entry) {
+			list_del(&event->entry);
+			kfree(event->data);
+			kfree(event);
+		}
+		kfree(ref);
+	}
+
 	kfree(proc);
 	mutex_unlock(&topic_lock);
 
@@ -375,6 +381,10 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 	mutex_lock(&topic_lock);
 	if(!list_empty(&proc->delivered_death)) {
 		list_for_each_entry_safe(ref, n_ref, &proc->delivered_death, proc_entry) {
+			if(ref->death_notifier) {
+				ref->target = NULL;
+				continue;
+			}
 			list_del(&ref->proc_entry);
 			list_for_each_entry_safe(event, n_event, &ref->event_queue, entry) {
 				list_del(&event->entry);
@@ -384,7 +394,7 @@ static unsigned int topic_poll(struct file *filp, struct poll_table_struct *wait
 			kfree(ref);
 		}
 		mutex_unlock(&topic_lock);
-		return 0;
+		return POLLHUP;
 	}
 	mutex_unlock(&topic_lock);
 
@@ -487,7 +497,7 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				kfree(topic_name);
 				break;
 			}
-			ref = create_topic_ref(proc, topic, subscribe.target);
+			ref = create_topic_ref(proc, topic, subscribe.target, subscribe.death_notifier);
 			if (!ref) {
 				ret = -EINVAL;
 				printk(KERN_ERR "topic_ioctl: Failed to create topic [%s] ref for IPC_TOPIC_SUBSCRIBE command\n", topic_name);
@@ -536,6 +546,49 @@ static long topic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						ret = delete_ret;
 						printk(KERN_ERR "topic_ioctl: Failed to delete topic for IPC_TOPIC_DELETE command\n");
 						break;
+					}
+				}
+			}
+			break;
+		}
+		case IPC_TOPIC_GET_LEGACY: {
+			struct topic_content *content_u = (struct topic_content *)ubuf;
+			struct topic_event *event, *n_event;
+			struct topic_ref *ref, *n_ref;
+			char __user *data;
+
+			put_user(0, &content_u->target.ptr);
+			if(!list_empty(&proc->delivered_death)) {
+				list_for_each_entry_safe(ref, n_ref, &proc->delivered_death, proc_entry) {
+					if(ref->death_notifier) {
+						list_del(&ref->proc_entry);
+						list_for_each_entry_safe(event, n_event, &ref->event_queue, entry) {
+							if (list_is_last(&event->entry, &ref->event_queue)) {
+								put_user(event->type, &content_u->type);
+								put_user(event->size, &content_u->data_size);
+								put_user(ref->death_notifier, &content_u->target.ptr);
+								if (get_user(data, (char * __user *)content_u->data)) {
+									ret = -EFAULT;
+									break;
+								}
+								if (copy_to_user(data, event->data, event->size)) {
+									ret = -EFAULT;
+									break;
+								}
+							}
+							list_del(&event->entry);
+							kfree(event->data);
+							kfree(event);
+						}
+						kfree(ref);
+					} else {
+						list_del(&ref->proc_entry);
+						list_for_each_entry_safe(event, n_event, &ref->event_queue, entry) {
+							list_del(&event->entry);
+							kfree(event->data);
+							kfree(event);
+						}
+						kfree(ref);
 					}
 				}
 			}

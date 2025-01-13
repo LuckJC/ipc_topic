@@ -61,6 +61,11 @@ void event_handler(struct topic_content *content)
 	printf("content: %s\n", content->data);
 }
 
+void death_handler(struct topic_content *content)
+{
+	printf("legacy event: %s\n", content->data);
+}
+
 typedef void *(*work_func_t)(struct topic_content *content);
 
 // 线程函数，用于在单独线程中获取主题数据
@@ -82,7 +87,7 @@ void *get_topic_data_thread(void *arg)
 	fds[0].revents = 0;
 
 	fds[1].fd = pipe_fd;
-	fds[1].events = POLLIN;
+	fds[1].events = POLLIN | POLLHUP;
 	fds[1].revents = 0;
 
 	while (1) {
@@ -102,6 +107,12 @@ void *get_topic_data_thread(void *arg)
 			perform_ioctl(fd, IPC_TOPIC_GET, &content);
 			// 调用处理函数处理获取到的主题内容
 			((work_func_t)content.target.ptr)(&content);
+		} else if(fds[0].revents & POLLHUP) {
+			printf("bye bye\n");
+			perform_ioctl(fd, IPC_TOPIC_GET_LEGACY, &content);
+			if(content.target.ptr) {
+				((work_func_t)content.target.ptr)(&content);
+			}
 		}
 
 		// 判断管道是否有可读事件发生（即收到退出通知）
@@ -175,6 +186,7 @@ int main(int argc, char *argv[])
 			subscribe.name_size = name_size;
 			subscribe.topic_name = topic_name;
 			subscribe.target = (void *)event_handler;
+			subscribe.death_notifier = (void*)death_handler;
 
 			// 使用ioctl调用内核模块的订阅主题数据功能（假设IPC_Topic_SUBSCRIBE是对应的命令）
 			perform_ioctl(fd, IPC_TOPIC_SUBSCRIBE, &subscribe);
